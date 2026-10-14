@@ -1,0 +1,656 @@
+﻿# Merge-IconTheme.ps1 — merge a selectable ARC (by niivu) theme variant into
+# copies of the pristine .mun originals using the Win32 resource-update API only.
+# Params: -Build (default) | -Verify | -Root (default (Join-Path $env:ProgramData 'ArcIcons')) |
+#         -Pair <name> | -Variant <arc|neutral-brown|neutral-grey|dark-grey>
+# -Variant picks the theme source directory AND the label recorded in
+# installed-manifest.json (theme + per-file themeFile + variantSource), so the
+# whole build/apply/verify pipeline stays pinned to the variant it built.
+# installed-manifest.json also carries sourceOrigin - the provenance of the
+# variant payload this build consumed: the source dir + a sha256 of every theme
+# file used, the landed variant archive's name + sha256 when that archive is
+# still on this PC (theme\ARC.zip / theme\arc-neutral-*.zip - the Archive field
+# of the variant table below), and repo/commit ONLY when the payload ships its
+# own source.json (a value that cannot be read is never invented).
+# The variant table below is the single owner of that mapping (ARC-Icons.ps1
+# keeps the operator-facing copy for the selector).
+# Never writes to C:\Windows; never modifies originals\ or theme\.
+# Writes stage\<name> copies + installed-manifest.json at the root.
+param(
+    [switch]$Build,
+    [switch]$Verify,
+    [string]$Root = (Join-Path $env:ProgramData 'ArcIcons'),
+    [string]$Pair = '',
+    [string]$Variant = 'arc'
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+if (-not $Build -and -not $Verify) { $Build = $true }
+
+$Root = (Resolve-Path -LiteralPath $Root).Path
+if ($Root -like 'C:\Windows*') { throw "Refusing to use a Root under C:\Windows (got '$Root')." }
+
+# ---- variant selection: one table owns the theme dir + the manifest label ----
+$VariantTable = [ordered]@{
+    'arc'           = [pscustomobject]@{ Id = 'arc';           Display = 'ARC (by niivu)';    ThemeDir = 'Windhawk Resources';                   Archive = 'ARC.zip' }
+    'neutral-brown' = [pscustomobject]@{ Id = 'neutral-brown'; Display = 'Arc Neutral Brown'; ThemeDir = 'Arc Neutral Brown\Windhawk Resources';  Archive = 'arc-neutral-brown.zip' }
+    'neutral-grey'  = [pscustomobject]@{ Id = 'neutral-grey';  Display = 'Arc Neutral Grey';  ThemeDir = 'Arc Neutral Grey\Windhawk Resources';   Archive = 'arc-neutral-grey.zip' }
+    'dark-grey'     = [pscustomobject]@{ Id = 'dark-grey';     Display = 'Arc Dark Grey';     ThemeDir = 'Arc Dark Grey\Windhawk Resources';      Archive = '' }
+}
+function Resolve-VariantKey([string]$Name) {
+    $key = ([string]$Name).Trim().ToLowerInvariant() -replace '[^a-z0-9]+', '-'
+    $key = $key.Trim('-')
+    $alias = @{
+        'arc' = 'arc'; 'arc-by-niivu' = 'arc'; 'niivu' = 'arc'; 'default' = 'arc'
+        'neutral-brown' = 'neutral-brown'; 'arc-neutral-brown' = 'neutral-brown'; 'brown' = 'neutral-brown'
+        'neutral-grey' = 'neutral-grey'; 'arc-neutral-grey' = 'neutral-grey'; 'grey' = 'neutral-grey'
+        'gray' = 'neutral-grey'; 'neutral-gray' = 'neutral-grey'; 'arc-neutral-gray' = 'neutral-grey'
+        'dark-grey' = 'dark-grey'; 'arc-dark-grey' = 'dark-grey'; 'dark-gray' = 'dark-grey'; 'arc-dark-gray' = 'dark-grey'
+    }
+    if ($alias.ContainsKey($key)) { return $alias[$key] }
+    throw ("Unknown -Variant '{0}'. Allowed: {1} (the display names work too)." -f $Name, (@($VariantTable.Keys) -join ' | '))
+}
+$VariantInfo = $VariantTable[(Resolve-VariantKey $Variant)]
+$ThemeRel = 'theme\' + $VariantInfo.ThemeDir
+$ThemeDirAbs = Join-Path $Root $ThemeRel
+if (-not (Test-Path -LiteralPath $ThemeDirAbs -PathType Container)) {
+    throw ("Variant '{0}' source is not on this PC: {1} (expected imageres.dll, imagesp1.dll, zipfldr.dll)." -f $VariantInfo.Display, $ThemeDirAbs)
+}
+Write-Output ("VARIANT: {0} source={1}" -f $VariantInfo.Display, $ThemeRel)
+
+$Pairs = @(
+    @{ Name = 'zipfldr.dll.mun';  Theme = 'zipfldr.dll'   },
+    @{ Name = 'imagesp1.dll.mun'; Theme = 'imagesp1.dll'  },
+    @{ Name = 'imageres.dll.mun'; Theme = 'imageres.dll'  }
+)
+if ($Pair) {
+    $Pairs = @($Pairs | Where-Object { $_.Name -eq $Pair -or $_.Name -like "$Pair*" })
+    if (-not $Pairs -or $Pairs.Count -eq 0) { throw "Unknown -Pair '$Pair'." }
+}
+
+$LangDefault = [uint16]0x0409
+
+# ---- Win32 interop (resource read via C# callbacks; update via Begin/Update/End) ----
+if (-not ([System.Management.Automation.PSTypeName]'ArcResMerge').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public class ArcMergeEntry {
+    public bool TypeIsInt; public int TypeInt; public string TypeForm;
+    public bool NameIsInt; public int NameInt; public string NameForm;
+    public ushort Lang; public byte[] Data;
+}
+
+public static class ArcResMerge {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr LoadLibraryEx(string f, IntPtr h, uint fl);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool FreeLibrary(IntPtr h);
+    delegate bool TProc(IntPtr h, IntPtr t, IntPtr p);
+    delegate bool NProc(IntPtr h, IntPtr t, IntPtr n, IntPtr p);
+    delegate bool LProc(IntPtr h, IntPtr t, IntPtr n, ushort l, IntPtr p);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool EnumResourceTypes(IntPtr h, TProc c, IntPtr p);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool EnumResourceNames(IntPtr h, IntPtr t, NProc c, IntPtr p);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool EnumResourceLanguages(IntPtr h, IntPtr t, IntPtr n, LProc c, IntPtr p);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr FindResourceEx(IntPtr h, IntPtr t, IntPtr n, ushort l);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr LoadResource(IntPtr h, IntPtr i);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr LockResource(IntPtr d);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint SizeofResource(IntPtr h, IntPtr i);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr BeginUpdateResource(string f, bool del);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool UpdateResource(IntPtr h, IntPtr t, IntPtr n, ushort l, byte[] d, uint c);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool EndUpdateResource(IntPtr h, bool discard);
+
+    static bool IsInt(IntPtr p) { return (((long)p) >> 16) == 0; }
+    // Resource-directory strings are COUNTED (WORD length prefix), not
+    // null-terminated: PtrToStringUni over-reads into adjacent data.
+    static string ExactStr(IntPtr p) {
+        try {
+            short len = Marshal.ReadInt16(new IntPtr(p.ToInt64() - 2));
+            if (len > 0 && len <= 512) {
+                char[] c = new char[len];
+                for (int i = 0; i < len; i++)
+                    c[i] = (char)Marshal.ReadInt16(new IntPtr(p.ToInt64() + i * 2));
+                return new string(c);
+            }
+        } catch { }
+        return Marshal.PtrToStringUni(p);
+    }
+    static string FormOf(IntPtr p) {
+        if (IsInt(p)) return "#" + ((int)p.ToInt64()).ToString();
+        return ExactStr(p);
+    }
+
+    public static List<ArcMergeEntry> Read(string path) {
+        IntPtr h = LoadLibraryEx(path, IntPtr.Zero, 2u);
+        if (h == IntPtr.Zero)
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "LoadLibraryEx failed: " + path);
+        List<ArcMergeEntry> all = new List<ArcMergeEntry>();
+        try {
+            TProc tc = (hm, tp, lp) => {
+                NProc nc = (hm2, tp2, np, lp2) => {
+                    string tf = FormOf(tp2);
+                    string nf = FormOf(np);
+                    bool ti = IsInt(tp2);
+                    bool ni = IsInt(np);
+                            int tii = ti ? (int)tp2.ToInt64() : -1;
+                            int nii = ni ? (int)np.ToInt64() : -1;
+                            LProc lc = (hm3, tp3, np3, lang, lp3) => {
+                                IntPtr hi = FindResourceEx(hm3, tp3, np3, lang);
+                                if (hi != IntPtr.Zero) {
+                                    IntPtr hd = LoadResource(hm3, hi);
+                                    if (hd != IntPtr.Zero) {
+                                        IntPtr ptr = LockResource(hd);
+                                        uint sz = SizeofResource(hm3, hi);
+                                        byte[] buf = new byte[sz];
+                                        if (sz > 0) Marshal.Copy(ptr, buf, 0, (int)sz);
+                                        ArcMergeEntry e = new ArcMergeEntry();
+                                        e.TypeIsInt = ti; e.TypeInt = tii; e.TypeForm = tf;
+                                        e.NameIsInt = ni; e.NameInt = nii; e.NameForm = nf;
+                                        e.Lang = lang; e.Data = buf;
+                                        all.Add(e);
+                                    }
+                                }
+                                return true;
+                            };
+                            EnumResourceLanguages(hm2, tp2, np, lc, IntPtr.Zero);
+                            GC.KeepAlive(lc);
+                        return true;
+                    };
+                    EnumResourceNames(hm, tp, nc, IntPtr.Zero);
+                    GC.KeepAlive(nc);
+                return true;
+            };
+            EnumResourceTypes(h, tc, IntPtr.Zero);
+            GC.KeepAlive(tc);
+        }
+        finally { FreeLibrary(h); }
+        return all;
+    }
+
+    // Wrappers capture GetLastWin32Error inside the same call: PowerShell's own
+    // Win32 traffic between a raw P/Invoke return and a PS-side read can clobber it.
+    public static int LastError;
+    public static IntPtr BeginUpd(string f) {
+        IntPtr h = BeginUpdateResource(f, false);
+        LastError = Marshal.GetLastWin32Error();
+        return h;
+    }
+    public static IntPtr BeginUpdDel(string f) {
+        IntPtr h = BeginUpdateResource(f, true);
+        LastError = Marshal.GetLastWin32Error();
+        return h;
+    }
+    public static bool UpdRes(IntPtr h, IntPtr t, IntPtr n, ushort l, byte[] d, uint c) {
+        bool ok = UpdateResource(h, t, n, l, d, c);
+        LastError = Marshal.GetLastWin32Error();
+        return ok;
+    }
+    public static bool EndUpd(IntPtr h, bool discard) {
+        bool ok = EndUpdateResource(h, discard);
+        LastError = Marshal.GetLastWin32Error();
+        return ok;
+    }
+
+    public static bool BytesEqual(byte[] a, byte[] b) {        if (Object.ReferenceEquals(a, b)) return true;
+        if (a == null || b == null) return false;
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+}
+'@
+}
+
+function New-ResPtr([string]$Form, [bool]$IsInt) {
+    if ($IsInt) {
+        if ($Form -notmatch '^#(\d+)$') { throw "Ordinal resource name expected, got '$Form'." }
+        return @{ Ptr = [IntPtr][int]$Matches[1]; Free = $false }
+    }
+    return @{ Ptr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($Form); Free = $true }
+}
+function Free-ResPtr($r) {
+    if ($r.Free) { [Runtime.InteropServices.Marshal]::FreeHGlobal($r.Ptr) }
+}
+
+# GRPICONDIR helpers: header WORD idReserved, WORD idType, WORD idCount;
+# each entry 14 bytes, nID = WORD at entry offset +12.
+function Get-GrpIconIds([byte[]]$b) {
+    $ids = @()
+    if ($b.Length -lt 6) { return $ids }
+    $count = [BitConverter]::ToUInt16($b, 4)
+    for ($i = 0; $i -lt $count; $i++) {
+        $off = 6 + $i * 14
+        if ($off + 14 -le $b.Length) { $ids += [BitConverter]::ToUInt16($b, $off + 12) }
+    }
+    return $ids
+}
+function Set-GrpIconId([byte[]]$b, [int]$Old, [int]$New) {
+    if ($b.Length -lt 6) { return }
+    $count = [BitConverter]::ToUInt16($b, 4)
+    $nb = [BitConverter]::GetBytes([uint16]$New)
+    for ($i = 0; $i -lt $count; $i++) {
+        $off = 6 + $i * 14 + 12
+        if ($off + 2 -le $b.Length -and [BitConverter]::ToUInt16($b, $off) -eq $Old) {
+            $b[$off] = $nb[0]; $b[$off + 1] = $nb[1]
+        }
+    }
+}
+
+function Get-IconMaps($Entries) {
+    # Returns @{ DestLang=@{}; Groups=@{}; IconOrds=@{} } for types #3/#14 only.
+    $destLang = @{}
+    $groups = @{}
+    $iconOrds = @{}
+    foreach ($e in $Entries) {
+        if ($e.TypeForm -ne '#3' -and $e.TypeForm -ne '#14') { continue }
+        $k = "$($e.TypeForm)|$($e.NameForm)"
+        if (-not $destLang.ContainsKey($k)) { $destLang[$k] = $e.Lang }
+        if ($e.TypeForm -eq '#14') {
+            if (-not $groups.ContainsKey($e.NameForm)) { $groups[$e.NameForm] = $e.Data }
+        }
+        elseif ($e.NameIsInt) { $iconOrds[$e.NameInt] = $true }
+    }
+    return @{ DestLang = $destLang; Groups = $groups; IconOrds = $iconOrds }
+}
+
+function Sort-RebuildEntries($Entries) {
+    # Order: numeric types ascending, then string types in first-seen order;
+    # within a type, enumeration order (stable via original index).
+    $strOrder = @{}
+    $next = 0
+    foreach ($e in $Entries) {
+        if (-not $e.TypeIsInt -and -not $strOrder.ContainsKey($e.TypeForm)) {
+            $strOrder[$e.TypeForm] = $next; $next++
+        }
+    }
+    $i = 0
+    $decor = foreach ($e in $Entries) { [pscustomobject]@{ E = $e; Ord = $i; SOrd = if ($e.TypeIsInt) { -1 } else { $strOrder[$e.TypeForm] } }; $i++ }
+    $sorted = @($decor | Sort-Object -Property @{ Expression = { if ($_.E.TypeIsInt) { 0 } else { 1 } } }, @{ Expression = { if ($_.E.TypeIsInt) { $_.E.TypeInt } else { $_.SOrd } } }, @{ Expression = { $_.Ord } } | ForEach-Object { $_.E })
+    return $sorted
+}
+
+function Add-ResEntry($h, $e, $Op) {
+    $tp = New-ResPtr $e.TypeForm ([bool]$e.TypeIsInt)
+    try {
+        $np = New-ResPtr $e.NameForm ([bool]$e.NameIsInt)
+        try {
+            $ok = [ArcResMerge]::UpdRes($h, $tp.Ptr, $np.Ptr, [uint16]$e.Lang, $e.Data, [uint32]$e.Data.Length)
+            if (-not $ok) {
+                $w = New-Object ComponentModel.Win32Exception([ArcResMerge]::LastError)
+                throw "$Op type '$($e.TypeForm)' name '$($e.NameForm)' lang $($e.Lang) failed: code $([ArcResMerge]::LastError) $($w.Message) — STOPPING."
+            }
+        }
+        finally { Free-ResPtr $np }
+    }
+    finally { Free-ResPtr $tp }
+}
+
+function Invoke-MergePair($PairName, $ThemeFile) {
+    $orig  = Join-Path $Root "originals\$PairName"
+    $theme = Join-Path $Root "$ThemeRel\$ThemeFile"
+    $stage = Join-Path $Root "stage\$PairName"
+    if ($stage -like 'C:\Windows*') { throw "Refusing to write under C:\Windows (got '$stage')." }
+    foreach ($p in @($orig, $theme)) {
+        if (-not (Test-Path -LiteralPath $p)) { throw "Missing input file: $p" }
+    }
+
+    $destRes  = [ArcResMerge]::Read($orig)
+    $themeRes = [ArcResMerge]::Read($theme)
+
+    $dest  = Get-IconMaps $destRes
+    $themeIcons = @($themeRes | Where-Object { $_.TypeForm -eq '#3' })
+    $themeGroups = @($themeRes | Where-Object { $_.TypeForm -eq '#14' })
+
+    # --- collision safety: theme icon ordinals referenced by untouched dest groups ---
+    $untouched = @($dest.Groups.Keys | Where-Object { -not (Test-IsThemeGroup $_ $themeGroups) })
+    $protected = @{}
+    foreach ($g in $untouched) {
+        foreach ($id in (Get-GrpIconIds $dest.Groups[$g])) { $protected[$id] = $true }
+    }
+    $used = @{}
+    foreach ($k in $dest.IconOrds.Keys) { $used[$k] = $true }
+    foreach ($e in $themeIcons) { if ($e.NameIsInt) { $used[$e.NameInt] = $true } }
+    $maxUsed = 0
+    foreach ($k in $used.Keys) { if ($k -gt $maxUsed) { $maxUsed = $k } }
+    $remap = @{}
+    foreach ($e in $themeIcons) {
+        if (-not $e.NameIsInt) { continue }
+        $id = $e.NameInt
+        if ($protected.ContainsKey($id) -and -not $remap.ContainsKey($id)) {
+            do { $maxUsed++ } while ($used.ContainsKey($maxUsed))
+            if ($maxUsed -gt 65535) { throw "Ordinal space exhausted while remapping icon #$id." }
+            $used[$maxUsed] = $true
+            $remap[$id] = $maxUsed
+        }
+    }
+    foreach ($ge in $themeGroups) {
+        foreach ($old in $remap.Keys) { Set-GrpIconId $ge.Data $old $remap[$old] }
+    }
+
+    # --- copy pristine original to stage, then delete-first full rebuild ---
+    $stageDir = Split-Path -Parent $stage
+    if (-not (Test-Path -LiteralPath $stageDir)) { New-Item -ItemType Directory -Path $stageDir | Out-Null }
+    Copy-Item -LiteralPath $orig -Destination $stage -Force
+
+    $rebuild = Sort-RebuildEntries $destRes
+
+    $h = [ArcResMerge]::BeginUpdDel($stage)
+    if ($h -eq [IntPtr]::Zero) {
+        $w = New-Object ComponentModel.Win32Exception([ArcResMerge]::LastError)
+        throw "BeginUpdateResource(deleteExisting=TRUE) failed on '$stage': code $([ArcResMerge]::LastError) $($w.Message) — STOPPING."
+    }
+    $committed = $false
+    $h = [IntPtr]::Zero
+    try {
+        # Single-write rule: within one update session each (type,name,lang) may
+        # be written exactly once (a second UpdateResource on the same key fails
+        # with code 50). Theme bytes are therefore substituted inline in the op
+        # list; genuinely-new theme entries are appended once. Measured: one
+        # session also caps out near ~3200 ops / ~23MB staged (imageres failed
+        # at PNG #5021 after ~3224 ops / ~23.4MB), while small pairs pass, and
+        # an incremental session on a rebuilt file succeeds. Ops are therefore
+        # packed into chunks (<=1200 entries and <=8MB each): chunk 0 opens
+        # with deleteExisting=TRUE, later chunks continue incrementally. Every
+        # key is still written exactly once, with the exact type/name form and
+        # language, using only the Win32 resource API.
+        $themeOverlay = @{}
+        foreach ($e in $themeIcons) {
+            $nm = if ($e.NameIsInt -and $remap.ContainsKey($e.NameInt)) { '#' + $remap[$e.NameInt] } else { $e.NameForm }
+            $themeOverlay["#3|$nm"] = @{ TypeForm = '#3'; TypeIsInt = $true; Data = $e.Data; NameForm = $nm; NameIsInt = $true }
+        }
+        foreach ($ge in $themeGroups) {
+            $themeOverlay["#14|$($ge.NameForm)"] = @{ TypeForm = '#14'; TypeIsInt = $true; Data = $ge.Data; NameForm = $ge.NameForm; NameIsInt = [bool]$ge.NameIsInt }
+        }
+        $coveredTN = @{}
+        $ops = New-Object System.Collections.ArrayList
+        $muiOps = New-Object System.Collections.ArrayList
+        foreach ($e in $rebuild) {
+            $tn = "$($e.TypeForm)|$($e.NameForm)"
+            if (($e.TypeForm -eq '#3' -or $e.TypeForm -eq '#14') -and $themeOverlay.ContainsKey($tn)) {
+                $ov = $themeOverlay[$tn]
+                $coveredTN[$tn] = $true
+                [void]$ops.Add(@{ TypeForm = $ov.TypeForm; TypeIsInt = $ov.TypeIsInt; NameForm = $ov.NameForm; NameIsInt = $ov.NameIsInt; Lang = [uint16]$e.Lang; Data = $ov.Data; Op = "theme-substitute $($e.TypeForm) $($e.NameForm) lang $($e.Lang)" })
+            }
+            elseif ($e.TypeForm -ceq 'MUI') {
+                # Measured: once a MUI entry exists (staged or committed), any
+                # later UpdateResource for type PNG fails with code 50
+                # (bisect: mui-then-png FAIL; img-then-png/img+icons/wave-then-png
+                # PASS; png-then-img+mui PASS). MUI ops go strictly last.
+                [void]$muiOps.Add(@{ TypeForm = $e.TypeForm; TypeIsInt = [bool]$e.TypeIsInt; NameForm = $e.NameForm; NameIsInt = [bool]$e.NameIsInt; Lang = [uint16]$e.Lang; Data = $e.Data; Op = "rebuild $($e.TypeForm) $($e.NameForm) lang $($e.Lang)" })
+            }
+            else {
+                [void]$ops.Add(@{ TypeForm = $e.TypeForm; TypeIsInt = [bool]$e.TypeIsInt; NameForm = $e.NameForm; NameIsInt = [bool]$e.NameIsInt; Lang = [uint16]$e.Lang; Data = $e.Data; Op = "rebuild $($e.TypeForm) $($e.NameForm) lang $($e.Lang)" })
+            }
+        }
+        foreach ($tn in $themeOverlay.Keys) {
+            if ($coveredTN.ContainsKey($tn)) { continue }
+            $ov = $themeOverlay[$tn]
+            $tlang = if ($dest.DestLang.ContainsKey($tn)) { [uint16]$dest.DestLang[$tn] } else { $LangDefault }
+            [void]$ops.Add(@{ TypeForm = $ov.TypeForm; TypeIsInt = $ov.TypeIsInt; NameForm = $ov.NameForm; NameIsInt = $ov.NameIsInt; Lang = $tlang; Data = $ov.Data; Op = "theme-add $tn lang $tlang" })
+        }
+        foreach ($op in $muiOps) { [void]$ops.Add($op) }
+        $chunks = New-Object System.Collections.ArrayList
+        $cur = New-Object System.Collections.ArrayList
+        $curBytes = 0
+        foreach ($op in $ops) {
+            if ($cur.Count -gt 0 -and ($cur.Count -ge 1200 -or ($curBytes + $op.Data.Length) -gt 8MB)) {
+                [void]$chunks.Add($cur.ToArray()); $cur = New-Object System.Collections.ArrayList; $curBytes = 0
+            }
+            [void]$cur.Add($op); $curBytes += $op.Data.Length
+        }
+        if ($cur.Count -gt 0) { [void]$chunks.Add($cur.ToArray()) }
+        Write-Host "SESSIONS ${PairName}: $($ops.Count) ops in $($chunks.Count) chunk(s)"
+        $ci = 0
+        foreach ($chunk in $chunks) {
+            # 5.1-safe byte sum (Measure-Object -Property does not take a
+            # scriptblock on Windows PowerShell 5.1).
+            $cb = 0
+            foreach ($ce in $chunk) { $cb += $ce.Data.Length }
+            Write-Host ("CHUNK {0}: {1} ops, {2} bytes, first={3} {4}, last={5} {6}" -f $ci, $chunk.Count, $cb, $chunk[0].TypeForm, $chunk[0].NameForm, $chunk[$chunk.Count-1].TypeForm, $chunk[$chunk.Count-1].NameForm)
+            $ci++
+        }
+        $si = 0
+        foreach ($chunk in $chunks) {
+            $delFirst = ($si -eq 0)
+            $h = if ($delFirst) { [ArcResMerge]::BeginUpdDel($stage) } else { [ArcResMerge]::BeginUpd($stage) }
+            if ($h -eq [IntPtr]::Zero) {
+                $w = New-Object ComponentModel.Win32Exception([ArcResMerge]::LastError)
+                throw "BeginUpdateResource(deleteExisting=$delFirst) session $si failed on '$stage': code $([ArcResMerge]::LastError) $($w.Message) — STOPPING."
+            }
+            $sessionOk = $false
+            try {
+                foreach ($op in $chunk) {
+                    $tp = New-ResPtr $op.TypeForm ([bool]$op.TypeIsInt)
+                    try {
+                        $np = New-ResPtr $op.NameForm ([bool]$op.NameIsInt)
+                        try {
+                            $ok = [ArcResMerge]::UpdRes($h, $tp.Ptr, $np.Ptr, [uint16]$op.Lang, $op.Data, [uint32]$op.Data.Length)
+                            if (-not $ok) {
+                                $w = New-Object ComponentModel.Win32Exception([ArcResMerge]::LastError)
+                                throw "UpdateResource session $si $($op.Op) failed: code $([ArcResMerge]::LastError) $($w.Message) — STOPPING."
+                            }
+                        }
+                        finally { Free-ResPtr $np }
+                    }
+                    finally { Free-ResPtr $tp }
+                }
+                if (-not [ArcResMerge]::EndUpd($h, $false)) {
+                    $w = New-Object ComponentModel.Win32Exception([ArcResMerge]::LastError)
+                    throw "EndUpdateResource session $si failed on '$stage': code $([ArcResMerge]::LastError) $($w.Message) — STOPPING."
+                }
+                $h = [IntPtr]::Zero
+                $sessionOk = $true
+            }
+            finally {
+                if (-not $sessionOk -and $h -ne [IntPtr]::Zero) { try { [void][ArcResMerge]::EndUpd($h, $true) } catch {}; $h = [IntPtr]::Zero }
+            }
+            $si++
+        }
+        $committed = $true
+    }
+    finally {
+        if (-not $committed -and $h -ne [IntPtr]::Zero) { try { [void][ArcResMerge]::EndUpd($h, $true) } catch {} }
+    }
+
+    # --- read back the merged copy for stats ---
+    $mergedRes = [ArcResMerge]::Read($stage)
+    $merged = Get-IconMaps $mergedRes
+    $themeGroupNames = @($themeGroups | ForEach-Object { $_.NameForm } | Sort-Object -Unique)
+    $added = @($themeGroupNames | Where-Object { -not $merged.Groups.ContainsKey($_) -or -not $dest.Groups.ContainsKey($_) } |
+        Where-Object { -not $dest.Groups.ContainsKey($_) })
+
+    return @{
+        Name = $PairName
+        GroupsOriginal = $dest.Groups.Count
+        GroupsMerged = $merged.Groups.Count
+        GroupsFromTheme = $themeGroupNames.Count
+        GroupsAdded = $added.Count
+        RemappedIcons = $remap.Count
+        RemapDetail = ($remap.Keys | Sort-Object | ForEach-Object { "$_->$($remap[$_])" }) -join ','
+        ThemeIcons = $themeIcons.Count
+    }
+}
+
+function Test-IsThemeGroup($Name, $ThemeGroupEntries) {
+    foreach ($ge in $ThemeGroupEntries) { if ($ge.NameForm -ceq $Name) { return $true } }
+    return $false
+}
+
+function Test-PairInvariants($PairName, $ThemeFile) {
+    # Strict byte checks: (a) superset, (b) theme groups identical, (c) untouched identical.
+    # NOTE: if collision remap rewrote theme groups, (b) reports which groups differ.
+    $orig  = Join-Path $Root "originals\$PairName"
+    $theme = Join-Path $Root "$ThemeRel\$ThemeFile"
+    $stage = Join-Path $Root "stage\$PairName"
+    $lines = @()
+    $ok = $true
+    if (-not (Test-Path -LiteralPath $stage)) {
+        return @{ Ok = $false; Lines = @("CHECK stage-exists: FAIL ($PairName not built)") }
+    }
+    $o = Get-IconMaps ([ArcResMerge]::Read($orig))
+    $m = Get-IconMaps ([ArcResMerge]::Read($stage))
+    $t = [ArcResMerge]::Read($theme)
+    $tGroups = @{}
+    foreach ($e in ($t | Where-Object { $_.TypeForm -eq '#14' })) {
+        if (-not $tGroups.ContainsKey($e.NameForm)) { $tGroups[$e.NameForm] = $e.Data }
+    }
+
+    $missing = @($o.Groups.Keys | Where-Object { -not $m.Groups.ContainsKey($_) })
+    if ($missing.Count -eq 0) { $lines += "CHECK ${PairName} group-superset: PASS (original $($o.Groups.Count), merged $($m.Groups.Count))" }
+    else { $lines += "CHECK ${PairName} group-superset: FAIL (missing $($missing.Count): $($missing -join ','))"; $ok = $false }
+
+    $badT = @()
+    foreach ($n in $tGroups.Keys) {
+        if (-not $m.Groups.ContainsKey($n)) { $badT += "$n(absent)"; continue }
+        if (-not [ArcResMerge]::BytesEqual($m.Groups[$n], $tGroups[$n])) { $badT += $n }
+    }
+    if ($badT.Count -eq 0) { $lines += "CHECK ${PairName} theme-groups-identical: PASS ($($tGroups.Count)/$($tGroups.Count))" }
+    else { $lines += "CHECK ${PairName} theme-groups-identical: FAIL ($($tGroups.Count - $badT.Count)/$($tGroups.Count) match; differ: $($badT -join ','))"; $ok = $false }
+
+    $badO = @()
+    foreach ($n in $o.Groups.Keys) {
+        if ($tGroups.ContainsKey($n)) { continue }
+        if (-not [ArcResMerge]::BytesEqual($m.Groups[$n], $o.Groups[$n])) { $badO += $n }
+    }
+    if ($badO.Count -eq 0) { $lines += "CHECK ${PairName} original-groups-preserved: PASS" }
+    else { $lines += "CHECK ${PairName} original-groups-preserved: FAIL (differ: $($badO -join ','))"; $ok = $false }
+
+    try {
+        $probe1 = [ArcResMerge]::Read($stage) | ForEach-Object { $_.TypeForm } | Sort-Object -Unique
+        $lines += "CHECK ${PairName} merged-loads-datafile: PASS (types $($probe1 -join ','))"
+    }
+    catch { $lines += "CHECK ${PairName} merged-loads-datafile: FAIL ($_)"; $ok = $false }
+
+    return @{ Ok = $ok; Lines = $lines }
+}
+
+if ($Verify) {
+    $allOk = $true
+    foreach ($p in $Pairs) {
+        $r = Test-PairInvariants $p.Name $p.Theme
+        foreach ($l in $r.Lines) { Write-Output $l }
+        if (-not $r.Ok) { $allOk = $false }
+    }
+    # manifest consistency: staged hashes must match installed-manifest.json
+    $mf = Join-Path $Root 'installed-manifest.json'
+    if (Test-Path -LiteralPath $mf) {
+        try {
+            $man = Get-Content -LiteralPath $mf -Raw | ConvertFrom-Json
+            foreach ($p in $Pairs) {
+                $st = Join-Path $Root "stage\$($p.Name)"
+                if (-not (Test-Path -LiteralPath $st)) { continue }
+                $h = (Get-FileHash -LiteralPath $st -Algorithm SHA256).Hash
+                $row = @($man.files | Where-Object { $_.name -eq $p.Name })[0]
+                if ($null -eq $row) { Write-Output "CHECK $($p.Name) manifest-row: FAIL (no row)"; $allOk = $false }
+                elseif ($row.mergedSha256 -ne $h) { Write-Output "CHECK $($p.Name) manifest-row: FAIL (hash mismatch)"; $allOk = $false }
+                else { Write-Output "CHECK $($p.Name) manifest-row: PASS" }
+            }
+        }
+        catch { Write-Output "CHECK manifest: FAIL ($_)"; $allOk = $false }
+    }
+    else { Write-Output 'CHECK manifest: FAIL (installed-manifest.json missing)'; $allOk = $false }
+    if ($allOk) { Write-Output 'ARC-MERGE: PASS' } else { Write-Output 'ARC-MERGE: FAIL' }
+    if (-not $allOk) { exit 1 }
+    exit 0
+}
+
+# ---- Build (zipfldr -> imagesp1 -> imageres; verify each pair before the next) ----
+$results = @()
+foreach ($p in $Pairs) {
+    $r = Invoke-MergePair $p.Name $p.Theme
+    $results += $r
+    Write-Output ("BUILD {0}: groupsOriginal={1} groupsMerged={2} groupsFromTheme={3} groupsAdded={4} themeIcons={5} remappedIcons={6}{7}" -f `
+        $r.Name, $r.GroupsOriginal, $r.GroupsMerged, $r.GroupsFromTheme, $r.GroupsAdded, $r.ThemeIcons, $r.RemappedIcons, `
+        $(if ($r.RemappedIcons -gt 0) { " [$($r.RemapDetail)]" } else { '' }))
+    $chkNow = Test-PairInvariants $p.Name $p.Theme
+    foreach ($l in $chkNow.Lines) { Write-Output $l }
+    if (-not $chkNow.Ok) { throw "Build verification failed for '$($p.Name)' — STOPPING before the next pair." }
+}
+
+# installed-manifest.json — the record of WHICH variant this build is pinned to
+# (theme = label, variantSource = theme dir, per-file themeFile = exact input),
+# so apply.ps1 / verify.ps1 / repair.ps1 never have to guess from originals\.
+$files = @()
+$originFiles = @()
+foreach ($r in $results) {
+    $stage = Join-Path $Root "stage\$($r.Name)"
+    $orig  = Join-Path $Root "originals\$($r.Name)"
+    $pairTheme = (@($Pairs | Where-Object { $_.Name -eq $r.Name })[0]).Theme
+    $chk = Test-PairInvariants $r.Name $pairTheme
+    $inv = if ($chk.Ok) { 'pass' } else { 'fail' }
+    foreach ($l in $chk.Lines) { Write-Output $l }
+    $files += [ordered]@{
+        name           = $r.Name
+        stagePath      = "stage\$($r.Name)"
+        originalSha256 = (Get-FileHash -LiteralPath $orig -Algorithm SHA256).Hash
+        mergedSha256   = (Get-FileHash -LiteralPath $stage -Algorithm SHA256).Hash
+        mergedSize     = (Get-Item -LiteralPath $stage).Length
+        groupsOriginal = $r.GroupsOriginal
+        groupsMerged   = $r.GroupsMerged
+        groupsFromTheme = $r.GroupsFromTheme
+        groupsAdded    = $r.GroupsAdded
+        remappedIcons  = $r.RemappedIcons
+        invariant      = $inv
+        themeFile      = "$ThemeRel\$pairTheme"
+    }
+    $themeInput = Join-Path $ThemeDirAbs $pairTheme
+    $originFiles += [ordered]@{
+        name   = $pairTheme
+        source = "$ThemeRel\$pairTheme"
+        sha256 = (Get-FileHash -LiteralPath $themeInput -Algorithm SHA256).Hash
+        size   = (Get-Item -LiteralPath $themeInput).Length
+    }
+}
+
+# ---- sourceOrigin: the applied theme's provenance is never blank ----
+# Always: the variant source dir + a sha256 of every theme file this build
+# consumed (so the exact payload can be re-fetched and re-checked). The landed
+# variant archive adds its name + sha256 while theme\<Archive> is still here.
+# repo/commit come ONLY from the payload's own source.json - a value that is not
+# readable is left out, never guessed.
+$sourceOrigin = [ordered]@{ sourceDir = $ThemeRel }
+$sourceOrigin['files'] = $originFiles
+$zipCandidate = Join-Path $Root ("theme\{0}" -f $VariantInfo.Archive)
+if (Test-Path -LiteralPath $zipCandidate -PathType Leaf) {
+    $sourceOrigin['archive'] = [ordered]@{
+        name   = (Split-Path -Leaf $zipCandidate)
+        sha256 = (Get-FileHash -LiteralPath $zipCandidate -Algorithm SHA256).Hash
+    }
+}
+$originSidecar = Join-Path $ThemeDirAbs 'source.json'
+if (Test-Path -LiteralPath $originSidecar -PathType Leaf) {
+    try {
+        $so = Get-Content -LiteralPath $originSidecar -Raw | ConvertFrom-Json
+        foreach ($k in @('repo', 'commit', 'archivePath')) {
+            if ($so.PSObject.Properties[$k] -and [string]$so.$k) { $sourceOrigin[$k] = [string]$so.$k }
+        }
+    } catch { Write-Output ("WARN source.json unreadable; repo/commit not recorded: {0}" -f $_) }
+}
+
+$manifest = [ordered]@{
+    theme         = $VariantInfo.Display
+    variantId     = $VariantInfo.Id
+    variantSource = $ThemeRel
+    sourceOrigin  = $sourceOrigin
+    session       = 'arcinstaller'
+    generated     = (Get-Date -Format 'o')
+    files         = $files
+}
+$mfPath = Join-Path $Root 'installed-manifest.json'
+($manifest | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $mfPath -Encoding utf8
+Write-Output "MANIFEST: $mfPath"
+$buildFail = @($files | Where-Object { $_.invariant -ne 'pass' })
+if ($buildFail.Count -eq 0) { Write-Output 'ARC-MERGE: PASS' } else { Write-Output 'ARC-MERGE: FAIL'; exit 1 }
