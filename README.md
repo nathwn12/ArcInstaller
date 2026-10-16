@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.svg" width="120" height="120" alt="ArcInstaller icon" />
+  <img src="icon/ArcInstaller.ico" width="120" height="120" alt="ArcInstaller icon" />
 </p>
 <h1 align="center">ArcInstaller</h1>
 <p align="center"><strong>Install, repair and revert the ARC icon theme for Windows themers — C#.</strong></p>
