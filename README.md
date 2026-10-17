@@ -25,7 +25,7 @@ ArcInstaller is a self-contained Windows installer for the ARC icon theme. It re
 
 ## Getting started
 
-Prerequisites: Windows 10/11 x64 and .NET Framework 4.x (its C# compiler ships at `%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`). ArcInstaller is not distributed as a prebuilt binary — the payload embeds niivu's ARC icon packs, which are not redistributed here, so the build fetches them from upstream (SHA-256 verified) and derives Arc Dark Grey locally.
+Prerequisites: Windows 10/11 x64, .NET Framework 4.x (its C# compiler ships at `%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`) and PowerShell 7 (`pwsh`, required for the fetch step; the build step runs under the in-box Windows PowerShell 5.1). ArcInstaller is not distributed as a prebuilt binary — the payload embeds niivu's ARC icon packs, which are not redistributed here, so the build fetches them from upstream (SHA-256 verified) and derives Arc Dark Grey locally.
 
 ```powershell
 git clone https://github.com/nathwn12/ArcInstaller.git
@@ -49,10 +49,10 @@ dist ArcInstaller.exe: 10256384 bytes sha256=3A2543EEABD9CE3B4ABD6BB4557204B6E90
 Run `dist\ArcInstaller.exe`, choose a variant in the dropdown and press **Apply**. **Revert** puts the pristine originals back, **Repair** re-applies when a payload has drifted, and **Refresh** clears the icon cache alone. The same actions work from a command line:
 
 ```powershell
-.\ArcInstaller.exe --cli -Action status
-.\ArcInstaller.exe --cli -Action apply -Variant dark-grey -Yes
-.\ArcInstaller.exe --cli -Action revert -Yes
-.\ArcInstaller.exe --selftest     # checks the embedded payload, touches nothing
+.\dist\ArcInstaller.exe --cli -Action status
+.\dist\ArcInstaller.exe --cli -Action apply -Variant dark-grey -Yes
+.\dist\ArcInstaller.exe --cli -Action revert -Yes
+.\dist\ArcInstaller.exe --selftest     # checks the embedded payload, touches nothing
 ```
 
 ## Project structure
@@ -91,11 +91,11 @@ There is no repo lint config (no `editorconfig`, no analyzers, no `.sln`/`.cspro
 There is no automated test suite. The repo's checks, in order:
 
 ```powershell
-.\ArcInstaller.exe --selftest        # embedded-payload check, touches nothing
+.\dist\ArcInstaller.exe --selftest        # embedded-payload check, touches nothing
 powershell -File .\verify.ps1        # read-only: state.json + manifests vs live SystemResources files
 ```
 
-Output of `.\ArcInstaller.exe --selftest` (exit code 0):
+Output of `.\dist\ArcInstaller.exe --selftest` (exit code 0):
 
 ```
 entries: 38
