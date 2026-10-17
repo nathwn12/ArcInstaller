@@ -34,6 +34,18 @@ pwsh -File .\fetch-theme.ps1     # download the icon packs, verify, derive Arc D
 powershell -File .\build.ps1     # -> dist\ArcInstaller.exe (run from Windows PowerShell 5.1)
 ```
 
+Real output of that command, captured 2026-10-17 on Windows 11 x64:
+
+```
+staged root: 9
+staged bin: 7
+staged docs: 2
+staged theme (skip zip): 20
+staged total files: 38
+payload.zip: 10180721 bytes
+dist ArcInstaller.exe: 10256384 bytes sha256=3A2543EEABD9CE3B4ABD6BB4557204B6E90F95A20231A5CFAC4920E6274C965E
+```
+
 Run `dist\ArcInstaller.exe`, choose a variant in the dropdown and press **Apply**. **Revert** puts the pristine originals back, **Repair** re-applies when a payload has drifted, and **Refresh** clears the icon cache alone. The same actions work from a command line:
 
 ```powershell
@@ -81,6 +93,41 @@ There is no automated test suite. The repo's checks, in order:
 ```powershell
 .\ArcInstaller.exe --selftest        # embedded-payload check, touches nothing
 powershell -File .\verify.ps1        # read-only: state.json + manifests vs live SystemResources files
+```
+
+Output of `.\ArcInstaller.exe --selftest` (exit code 0):
+
+```
+entries: 38
+sample ARC-Icons.ps1 05630125C291E598FE929DC8BB570CE2CEB7B2293F15A2DF637DAAC1E5A8E5FD
+sample bin\Set-BaselineSecurity.ps1 C3D81925A7B0A477CC4FA001B0E3AF89F97449EA4814094A72E0FF1773D3EA0E
+sample theme\Windhawk Resources\imageres.dll 8967B04B382855DA0E7D11A42780E864C16FBAD4AE0797CA37735E19AF50A42F
+```
+
+Output of `powershell -File .\verify.ps1`, captured on a Windows 11 x64 machine that already had Arc Dark Grey installed, so a different machine's `mode=` line will differ:
+
+```
+ARC-ICONS-VERIFY: mode=installed root=C:\ProgramData\ArcIcons sysdir=C:\WINDOWS\SystemResources
+ARC-ICONS-VERIFY: built=Arc Dark Grey source=theme\Arc Dark Grey\Windhawk Resources
+--- imageres.dll.mun
+  [hash] OK 6F33AA447B522A68EFE46F96695EE9DABD8FAE4D4071595FA7A56D62943BD2E0 == 6F33AA447B522A68EFE46F96695EE9DABD8FAE4D4071595FA7A56D62943BD2E0 (merged)
+  [sd:live] OK owner+group+DACL+protection == baseline
+  [load] OK LoadLibraryEx AS_DATAFILE
+  [invariants] theme=theme\Arc Dark Grey\Windhawk Resources\imageres.dll
+  [invariants] OK CHECK merged-loads-image-resource: PASS (entries 3236, types #14,#16,#2,#3,IMAGE,MUI,PNG,WAVE) | CHECK merged-enumerates-types: PASS (#14,#16,#2,#3,IMAGE,MUI,PNG,WAVE) | ARC-ICONS-INVARIANT: PASS
+--- imagesp1.dll.mun
+  [hash] OK 64C6BDD118A93907BF30BF6EAD89E10CB1A8BF86388DBCF8C38C1C22CC1FD42E == 64C6BDD118A93907BF30BF6EAD89E10CB1A8BF86388DBCF8C38C1C22CC1FD42E (merged)
+  [sd:live] OK owner+group+DACL+protection == baseline
+  [load] OK LoadLibraryEx AS_DATAFILE
+  [invariants] theme=theme\Arc Dark Grey\Windhawk Resources\imagesp1.dll
+  [invariants] OK CHECK merged-loads-image-resource: PASS (entries 98, types #14,#16,#3) | CHECK merged-enumerates-types: PASS (#14,#16,#3) | ARC-ICONS-INVARIANT: PASS
+--- zipfldr.dll.mun
+  [hash] OK 6475F498FDDE18274C773CEC397DEB87094C1FE249080D8A5D0E6A956FD70925 == 6475F498FDDE18274C773CEC397DEB87094C1FE249080D8A5D0E6A956FD70925 (merged)
+  [sd:live] OK owner+group+DACL+protection == baseline
+  [load] OK LoadLibraryEx AS_DATAFILE
+  [invariants] theme=theme\Arc Dark Grey\Windhawk Resources\zipfldr.dll
+  [invariants] OK CHECK merged-loads-image-resource: PASS (entries 31, types #14,#16,#24,#3,MUI,WEVT_TEMPLATE) | CHECK merged-enumerates-types: PASS (#14,#16,#24,#3,MUI,WEVT_TEMPLATE) | ARC-ICONS-INVARIANT: PASS
+ARC-ICONS-VERIFY: PASS
 ```
 
 `verify.ps1` fails on empty or missing manifests and on any `state.json` mode outside `installed|original|partial|drifted`; per-file it compares live SHA-256 against the recorded hash and the full SDDL on the live path and every surviving hardlink sibling. Apply, verify and revert are exercised on Windows 11 x64; the four-variant matrix and a clean-machine run are not yet proven end to end.
