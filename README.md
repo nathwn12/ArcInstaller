@@ -2,7 +2,7 @@
   <img src="icon/ArcInstaller.ico" width="120" height="120" alt="ArcInstaller icon" />
 </p>
 <h1 align="center">ArcInstaller</h1>
-<p align="center"><strong>Install, repair and revert the ARC icon theme for Windows themers — C#.</strong></p>
+<p align="center"><strong>Install, repair and revert the ARC icon theme for Windows themers — C# and PowerShell.</strong></p>
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/ArcInstaller" alt="License" /></a>
   <img src="https://img.shields.io/github/languages/top/nathwn12/ArcInstaller" alt="Language" />
