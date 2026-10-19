@@ -1,6 +1,8 @@
-# ArcInstaller
-
-**Get the ARC icon theme on your Windows desktop, and put the stock icons back whenever you want.**
+<p align="center">
+  <img src="icon/ArcInstaller.ico" width="120" height="120" alt="ArcInstaller icon" />
+</p>
+<h1 align="center">ArcInstaller</h1>
+<p align="center"><strong>Get the ARC icon theme on your Windows desktop, and put the stock icons back whenever you want.</strong></p>
 
 ## Install
 
@@ -50,3 +52,11 @@ Four variants ship in the one exe: ARC, Arc Neutral Brown, Arc Neutral Grey, and
 - [Where it lives](docs/WHERE-IT-LIVES.md)
 - [Upstream icon packs](https://github.com/niivu/resource-redirect-icon-themes)
 - [License (MIT)](LICENSE)
+
+<!-- nathwn12 house footer: identical in every repo. Do not edit. -->
+<p align="center">
+  <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
+</p>
+<p align="center">
+  <sub>Built by <a href="https://github.com/nathwn12">nathwn12</a> · <a href="https://github.com/nathwn12?tab=repositories">All projects</a></sub>
+</p>
