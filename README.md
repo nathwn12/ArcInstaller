@@ -15,12 +15,6 @@ powershell -File .\build.ps1
 
 The fetch step downloads the icon packs from upstream and checks every archive against a pinned SHA-256. The build step compiles `dist\ArcInstaller.exe`. The app replaces three icon payloads in the Windows SystemResources folder with merged copies that keep every stock resource, and it backs up your originals before the first write so revert works.
 
-### Or let your AI install it
-
-```text
-Clone https://github.com/nathwn12/ArcInstaller.git, then run pwsh -File .\fetch-theme.ps1 followed by powershell -File .\build.ps1. Prove it with .\dist\ArcInstaller.exe --selftest and then powershell -File .\verify.ps1, and report both outputs.
-```
-
 ## Use it
 
 Run `dist\ArcInstaller.exe`, pick a variant in the dropdown, and press Apply. Repair re-applies the theme when a payload drifts, Revert puts your originals back, and Refresh clears the icon cache. The same actions work from a command line:
