@@ -38,6 +38,34 @@ Four variants ship in the one exe: ARC, Arc Neutral Brown, Arc Neutral Grey, and
 - Read-only checks: `--selftest` verifies the embedded payload, `verify.ps1` compares live files against recorded hashes.
 - Optional auto-repair task that re-applies the theme when Windows replaces a payload.
 
+## Commands
+
+You run every action through the exe. The form is `--cli -Action <name>`:
+
+| Action | Command | What it does |
+| --- | --- | --- |
+| `menu` | `.\dist\ArcInstaller.exe --cli -Action menu` | Opens the interactive menu |
+| `apply` | `.\dist\ArcInstaller.exe --cli -Action apply` | Applies or re-applies the theme for the selected variant |
+| `revert` | `.\dist\ArcInstaller.exe --cli -Action revert` | Puts the backed-up Windows originals back |
+| `repair` | `.\dist\ArcInstaller.exe --cli -Action repair` | Re-applies only payloads that drifted, then refreshes the icon cache |
+| `status` | `.\dist\ArcInstaller.exe --cli -Action status` | Shows install state and verifies the payloads |
+| `refresh` | `.\dist\ArcInstaller.exe --cli -Action refresh` | Rebuilds the shell icon cache |
+| `merge` | `.\dist\ArcInstaller.exe --cli -Action merge` | Rebuilds the merged files from originals plus theme before you re-apply |
+| `task-on` | `.\dist\ArcInstaller.exe --cli -Action task-on` | Enables the auto-repair task at startup |
+| `task-off` | `.\dist\ArcInstaller.exe --cli -Action task-off` | Disables the auto-repair task |
+
+You pick a variant with `-Variant <id>`. The four ids are `arc`, `neutral-brown`, `neutral-grey`, and `dark-grey`:
+
+```powershell
+.\dist\ArcInstaller.exe --cli -Action apply -Variant neutral-brown -Yes
+```
+
+You add `-Yes` to skip confirmations. You add `-DryRun` to preview an apply or revert without writing. Repair has no preview mode, so you run it without `-DryRun`:
+
+```powershell
+.\dist\ArcInstaller.exe --cli -Action apply -Variant dark-grey -DryRun
+```
+
 ## Requirements
 
 - Windows 10 or 11, 64-bit, with administrator rights.
